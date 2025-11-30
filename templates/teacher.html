@@ -738,6 +738,15 @@ async function refreshPresence(){
     grid.appendChild(card);
   });
 }
+function timeAgo(ts){
+  if(!ts) return 'a while ago';
+  const s = Math.max(1, Math.floor((Date.now()-ts)/1000));
+  if(s<60) return s+'s ago';
+  const m = Math.floor(s/60); if(m<60) return m+'m ago';
+  const h = Math.floor(m/60); return h+'h ago';
+}
+refreshPresence();
+setInterval(refreshPresence, 8000);
 
 async function loadYouTubeRules(){
   const res=await fetch('/api/youtube_rules');
