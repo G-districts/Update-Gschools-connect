@@ -2667,6 +2667,7 @@ def api_notify():
     save_data(d)
     log_action({"event": "notify", "title": title})
     return jsonify({"ok": True})
+
 # =========================
 # Image AI Filter (per-image, for extension)
 # =========================
