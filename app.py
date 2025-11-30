@@ -1510,7 +1510,7 @@ def api_policy():
 
     resp = {
         "blocked_redirect": d.get("settings", {}).get(
-            "blocked_redirect", "https://classroom.google.com"
+            "blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block"
         ),
         "active_policy": ap,
         "focus_mode": bool(focus),
