@@ -604,7 +604,7 @@
   </div>
 </dialog>
 
-<!-- DM small dialog (not used for main chat anymore, but kept harmless) -->
+<!-- DM small dialog -->
 <dialog id="dmDlg">
   <h4>Message Student</h4>
   <textarea id="dmInput" rows="3" placeholder="Type a private message"></textarea>
@@ -1091,7 +1091,7 @@ $('#stuDM').onclick=()=>{
   openDM(student, student);
 };
 
-/* Small DM dialog (still works but not primary anymore) */
+/* Small DM dialog */
 $('#dmClose').onclick=()=>$('#dmDlg').close();
 $('#dmSend').onclick=async()=>{
   const text=$('#dmInput').value.trim(); if(!text){ alert('Type a message'); return; }
@@ -1099,7 +1099,6 @@ $('#dmSend').onclick=async()=>{
   await fetch('/api/dm/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({student, text, from:'teacher'})});
   $('#dmDlg').close(); toast('DM sent');
 };
-/* Enter to send for DM dialog (Shift+Enter = newline) */
 $('#dmInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -1676,7 +1675,6 @@ const dmCloseBtn= document.getElementById('dmCloseBtn');
 const dmForm    = document.getElementById('dmForm');
 const dmInputBig= document.getElementById('dmInputBig');
 
-/* Open big chat for a student */
 function openDM(studentEmail, displayName){
   currentDmStudent = studentEmail;
   currentDmDisplayName = displayName || studentEmail;
@@ -1710,7 +1708,7 @@ async function loadDmMessages(){
   try{
     const res = await fetch('/api/dm/me?student=' + encodeURIComponent(currentDmStudent));
     if (!res.ok) return;
-    const msgs = await res.json(); // array: [{from, user, text, ts}, ...]
+    const msgs = await res.json();
 
     dmMessages.innerHTML = '';
     if (!msgs.length){
