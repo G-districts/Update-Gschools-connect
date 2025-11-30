@@ -1,40 +1,14 @@
-"""
-Simple image safety classifier for Gschools image filtering.
-
-This module is intentionally lightweight and self-contained so it can run
-on typical school servers without a GPU. It is NOT a full NSFW model,
-but it provides a reasonable starting point that can be swapped out for
-a more advanced model later (e.g. ONNX / TensorRT / cloud vision API).
-
-Interface:
-    classify_image(image_bytes: bytes, *, src: str = "", page_url: str = "") -> dict
-
-Returns a dict:
-    {
-        "explicit_nudity": float 0–1,
-        "partial_nudity": float 0–1,
-        "suggestive": float 0–1,
-        "violence": float 0–1,
-        "weapon": float 0–1,
-        "self_harm": float 0–1,
-        "other": float 0–1,
-    }
-"""
-
-from __future__ import annotations
-
+import os
 import base64
 import io
-import math
-from typing import Dict
+from typing import Dict, Any
 
-try:
-    from PIL import Image
-except Exception:  # Pillow not installed – classifier will fall back to URL heuristics only
-    Image = None
+from openai import OpenAI
 
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-LABELS = [
+# Main labels your system understands
+GSCHOOL_LABELS = [
     "explicit_nudity",
     "partial_nudity",
     "suggestive",
@@ -45,165 +19,155 @@ LABELS = [
 ]
 
 
-# Basic keyword hints – this complements the skin-tone heuristic and also
-# allows detection when we cannot read the actual pixels (e.g. CORS/tainted canvas).
-NSFW_KEYWORDS = [
-    "porn", "xxx", "sex", "nude", "nudes", "nsfw", "onlyfans", "camgirl",
-    "xvideos", "xnxx", "redtube", "youporn", "pornhub", "hentai",
-]
-
-VIOLENCE_KEYWORDS = [
-    "gore", "blood", "beheading", "murder", "killshot", "execution",
-]
-
-WEAPON_KEYWORDS = [
-    "gun", "pistol", "rifle", "shotgun", "ak47", "ar15", "knife", "machete",
-    "grenade", "rocket launcher", "rpg", "sniper",
-]
-
-SELF_HARM_KEYWORDS = [
-    "selfharm", "self-harm", "suicide", "killmyself", "kms", "cutting",
-]
-
-
-def _from_data_url(data_url: str) -> bytes | None:
-    if not data_url:
-        return None
-    if "," not in data_url:
-        # assume just base64
-        try:
-            return base64.b64decode(data_url)
-        except Exception:
-            return None
-    try:
-        header, b64 = data_url.split(",", 1)
-        return base64.b64decode(b64)
-    except Exception:
-        return None
-
-
-def _skin_ratio(img: "Image.Image") -> float:
+def _extract_image_input(image_data_url_or_bytes: Any) -> Dict[str, Any]:
     """
-    Very rough skin detector, based on RGB rules-of-thumb.
+    Build the 'input' field for OpenAI moderation.
 
-    This is NOT perfect, but it can help flag images with a very high
-    proportion of skin-tone pixels as potentially explicit.
+    If you are passing an image URL from the extension, you can send:
+      { "type": "image_url", "image_url": { "url": "https://..." } }
+
+    If you're passing a data URL (data:image/png;base64,...), we
+    can strip the header and send as base64.
+
+    Here we assume the extension is sending a data URL string.
     """
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-    w, h = img.size
-    if w == 0 or h == 0:
-        return 0.0
-    # Downsample for speed
-    max_side = 256
-    scale = min(1.0, max_side / float(max(w, h)))
-    if scale < 1.0:
-        img = img.resize((int(w * scale), int(h * scale)))
-        w, h = img.size
+    if isinstance(image_data_url_or_bytes, str):
+        # Expect something like: "data:image/png;base64,AAAA..."
+        if "," in image_data_url_or_bytes:
+            header, b64 = image_data_url_or_bytes.split(",", 1)
+        else:
+            # Already just base64
+            b64 = image_data_url_or_bytes
 
-    pixels = img.load()
-    if pixels is None:
-        return 0.0
+        # You can either send as bytes or use image_url w/ base64:
+        # The moderation API example in your docs mainly shows image_url with URL.
+        # For safety & clarity, let's use image_url with a "data:" URL.
+        data_url = f"data:image/png;base64,{b64}"
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": data_url
+            }
+        }
 
-    total = 0
-    skin = 0
-    for y in range(h):
-        for x in range(w):
-            r, g, b = pixels[x, y][:3]
-            total += 1
-            # Very simple RGB skin detection heuristic
-            if (
-                r > 95
-                and g > 40
-                and b > 20
-                and max(r, g, b) - min(r, g, b) > 15
-                and abs(r - g) > 15
-                and r > g
-                and r > b
-            ):
-                skin += 1
-    if total == 0:
-        return 0.0
-    return float(skin) / float(total)
+    # If you somehow get raw bytes, you could also encode them:
+    if isinstance(image_data_url_or_bytes, (bytes, bytearray)):
+        b64 = base64.b64encode(image_data_url_or_bytes).decode("ascii")
+        data_url = f"data:image/png;base64,{b64}"
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": data_url
+            }
+        }
+
+    # Fallback – no image
+    return None
 
 
-def _keyword_boost(text: str) -> Dict[str, float]:
-    text = (text or "").lower()
-    scores = {k: 0.0 for k in LABELS}
+def _map_openai_scores_to_gschool(scores: Dict[str, float]) -> Dict[str, float]:
+    sexual = float(scores.get("sexual", 0.0) or 0.0)
+    self_harm_raw = max(
+        float(scores.get("self-harm", 0.0) or 0.0),
+        float(scores.get("self-harm/intent", 0.0) or 0.0),
+        float(scores.get("self-harm/instructions", 0.0) or 0.0),
+    )
+    violence = float(scores.get("violence", 0.0) or 0.0)
+    graphic = float(scores.get("violence/graphic", 0.0) or 0.0)
 
-    if any(k in text for k in NSFW_KEYWORDS):
-        scores["explicit_nudity"] = 0.9
-        scores["partial_nudity"] = max(scores["partial_nudity"], 0.7)
-        scores["suggestive"] = max(scores["suggestive"], 0.6)
+    explicit_nudity = sexual
+    partial_nudity = min(1.0, sexual * 0.9)
+    suggestive = min(1.0, sexual * 0.8)
+    violence_score = max(violence, graphic)
+    weapon_score = violence_score  # approx; can refine later
 
-    if any(k in text for k in VIOLENCE_KEYWORDS):
-        scores["violence"] = 0.9
+    out = {
+        "explicit_nudity": explicit_nudity,
+        "partial_nudity": partial_nudity,
+        "suggestive": suggestive,
+        "violence": violence_score,
+        "weapon": weapon_score,
+        "self_harm": self_harm_raw,
+        "other": 0.0,
+    }
 
-    if any(k in text for k in WEAPON_KEYWORDS):
-        scores["weapon"] = 0.9
+    # Ensure all labels exist
+    for k in GSCHOOL_LABELS:
+        out.setdefault(k, 0.0)
 
-    if any(k in text for k in SELF_HARM_KEYWORDS):
-        scores["self_harm"] = 0.9
-
-    return scores
+    return out
 
 
-def classify_image(
-    image_bytes_or_data_url: bytes | str | None,
+def classify_image_with_openai(
+    image_data_url_or_bytes: Any,
     *,
-    src: str = "",
     page_url: str = "",
-) -> Dict[str, float]:
+    src_url: str = "",
+    block_threshold: float = 0.3,
+) -> Dict[str, Any]:
     """
-    Classify an image into coarse safety categories.
-
-    This implementation is intentionally conservative: it tends to
-    over-block when there is a high skin ratio or strong NSFW keywords
-    in the URL. For production you can replace the internals with a
-    stronger model while keeping the same interface.
+    Call OpenAI omni-moderation-latest on an image (and optional text context),
+    map its scores to G-School categories, and return a suggested action.
     """
-    scores = {k: 0.0 for k in LABELS}
-
-    # URL-based hints first
-    kw_scores = _keyword_boost((src or "") + " " + (page_url or ""))
-    for k, v in kw_scores.items():
-        scores[k] = max(scores[k], v)
-
-    # Pixel-based heuristic (if Pillow available and we have bytes)
-    img_bytes: bytes | None
-    if isinstance(image_bytes_or_data_url, str):
-        img_bytes = _from_data_url(image_bytes_or_data_url)
-    else:
-        img_bytes = image_bytes_or_data_url
-
-    if Image is not None and img_bytes:
-        try:
-            img = Image.open(io.BytesIO(img_bytes))
-            sr = _skin_ratio(img)
-            # Tune thresholds: high skin ratio => likely explicit
-            if sr > 0.5:
-                scores["explicit_nudity"] = max(scores["explicit_nudity"], 0.9)
-                scores["partial_nudity"] = max(scores["partial_nudity"], 0.7)
-            elif sr > 0.35:
-                scores["partial_nudity"] = max(scores["partial_nudity"], 0.7)
-                scores["suggestive"] = max(scores["suggestive"], 0.6)
-            elif sr > 0.2:
-                scores["suggestive"] = max(scores["suggestive"], 0.5)
-        except Exception:
-            # If anything goes wrong, we just rely on keyword-based hints
-            pass
-
-    # Ensure at least one label has some probability (for logging)
-    if all(v <= 0.0 for v in scores.values()):
+    img_input = _extract_image_input(image_data_url_or_bytes)
+    if not img_input:
+        # No image – allow by default but mark other slightly
+        scores = {k: 0.0 for k in GSCHOOL_LABELS}
         scores["other"] = 0.01
+        return {
+            "ok": True,
+            "action": "allow",
+            "scores": scores,
+            "reason": "no_image",
+        }
 
-    # Clamp to [0,1]
-    for k in list(scores.keys()):
-        v = scores[k]
-        if v < 0:
-            v = 0.0
-        elif v > 1:
-            v = 1.0
-        scores[k] = float(v)
+    # Build combined input: optional text context + the image
+    inputs = []
+    text_ctx = (page_url or "") + " " + (src_url or "")
+    if text_ctx.strip():
+        inputs.append({"type": "text", "text": text_ctx.strip()})
+    inputs.append(img_input)
 
-    return scores
+    try:
+        resp = client.moderations.create(
+            model="omni-moderation-latest",
+            input=inputs,
+        )
+    except Exception as e:
+        # If the moderation API fails, fail-open or fail-closed depending on your preference.
+        # In school context it's safer to fail CLOSED (block) for suspicious sources.
+        scores = {k: 0.0 for k in GSCHOOL_LABELS}
+        return {
+            "ok": False,
+            "action": "block",
+            "scores": scores,
+            "reason": f"openai_error: {e}",
+        }
+
+    if not resp or not getattr(resp, "results", None):
+        scores = {k: 0.0 for k in GSCHOOL_LABELS}
+        return {
+            "ok": False,
+            "action": "block",
+            "scores": scores,
+            "reason": "openai_no_results",
+        }
+
+    r0 = resp.results[0]
+    raw_scores = dict(r0.category_scores or {})
+    mapped = _map_openai_scores_to_gschool(raw_scores)
+
+    max_label = max(mapped, key=lambda k: mapped[k])
+    max_val = mapped[max_label]
+
+    action = "block" if max_val >= float(block_threshold) else "allow"
+
+    reason = f"openai: {max_label}={max_val:.3f}"
+
+    return {
+        "ok": True,
+        "action": action,
+        "scores": mapped,
+        "reason": reason,
+        "openai_flagged": bool(r0.flagged),
+    }
