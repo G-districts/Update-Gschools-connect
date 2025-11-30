@@ -167,6 +167,16 @@
   .thumbbar{display:flex; gap:6px; padding-top:6px; overflow:hidden}
   .thumbbar img{width:22px; height:22px; border-radius:4px; border:1px solid #e5e8f0; background:#fff}
   .card .status{display:flex; justify-content:space-between; align-items:center}
+
+  /* DM conversation thread */
+  .dm-thread{background:#f3f4f6;border-radius:8px;padding:8px;max-height:260px;overflow:auto;margin-bottom:8px;font-size:14px;}
+  .dm-msg{display:flex;flex-direction:column;max-width:80%;margin:4px 0;}
+  .dm-msg.me{margin-left:auto;align-items:flex-end;}
+  .dm-msg.them{margin-right:auto;align-items:flex-start;}
+  .dm-msg .bubble{padding:6px 10px;border-radius:14px;border:1px solid var(--border);background:#fff;}
+  .dm-msg.me .bubble{background:var(--brand);color:#fff;border-color:var(--brand);}
+  .dm-msg .meta{font-size:11px;color:var(--muted);margin-top:2px;}
+
 </style>
 </head>
 <body>
@@ -201,6 +211,16 @@
             <div class="rowbtn" data-dd="disable-scene">🚫 <span>Disable Scene</span></div>
             <div class="rowbtn" data-dd="create-scene">➕ <span>Create New Scene</span></div>
           </div>
+          
+          <div class="group">
+            <div class="muted" style="padding:4px 6px;">Apply to</div>
+            <div class="row" style="gap:8px; padding:4px 6px; align-items:center; flex-wrap:wrap">
+              <label class="mini"><input type="radio" name="sceneScope" id="sceneScopeClass" value="class" checked> Whole class</label>
+              <label class="mini"><input type="radio" name="sceneScope" id="sceneScopeStudent" value="student"> Selected student</label>
+            </div>
+            <small class="muted" style="padding:0 6px 6px;">When “Selected student” is chosen, the scene will apply only to the student picked in Per-Student Controls.</small>
+          </div>
+
           <div class="group" id="ddAllowed">
             <div class="muted" style="padding:4px 6px;">Enable Allowed Websites List</div>
           </div>
@@ -442,6 +462,7 @@
 <!-- DM -->
 <dialog id="dmDlg">
   <h4>Message Student</h4>
+  <div id="dmThread" class="dm-thread"></div>
   <textarea id="dmInput" rows="3" placeholder="Type a private message"></textarea>
   <div class="row" style="justify-content:flex-end; margin-top:8px">
     <button class="btn" id="dmSend">Send</button>
@@ -707,25 +728,8 @@ async function refreshPresence(){
     const dmBtn=document.createElement('button');
     dmBtn.className='btn secondary';
     dmBtn.textContent='Chat';
-    dmBtn.onclick=()=>{
-      const sel = $('#studentSelect');
-      if(sel){
-        let found = false;
-        for (const opt of Array.from(sel.options || [])){
-          if (opt.value === student){ found = true; break; }
-        }
-        if(!found){
-          const opt = document.createElement('option');
-          opt.value = student;
-          opt.textContent = student;
-          sel.appendChild(opt);
-        }
-        sel.value = student;
-      }
-      $('#dmDlg').showModal();
-    };
-
-    const view=document.createElement('button'); 
+    dmBtn.onclick=()=> openDmDialogFor(student);
+const view=document.createElement('button'); 
     view.className='btn'; 
     view.textContent='View';
     view.onclick=()=> openMonitor(student);
@@ -904,15 +908,99 @@ $('#stuCloseTabs').onclick=async()=>{
   if(studentCache[student]){ studentCache[student].tabshots={}; persistCache(); }
   toast('Close requested');
 };
-$('#stuDM').onclick=()=>$('#dmDlg').showModal();
-$('#dmClose').onclick=()=>$('#dmDlg').close();
-$('#dmSend').onclick=async()=>{
-  const text=$('#dmInput').value.trim(); if(!text){ alert('Type a message'); return; }
-  const student=currentStudent(); if(!student){ alert('Pick a student first'); return; }
-  await fetch('/api/dm/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({student, text, from:'teacher'})});
-  $('#dmDlg').close(); toast('DM sent');
-};
+let currentDmStudent = null;
+let dmPollTimer = null;
 
+function openDmDialogFor(student){
+  currentDmStudent = student;
+  const sel = $('#studentSelect');
+  if(sel){
+    let found = false;
+    for (const opt of Array.from(sel.options || [])){
+      if (opt.value === student){ found = true; break; }
+    }
+    if(!found){
+      const opt = document.createElement('option');
+      opt.value = student;
+      opt.textContent = student;
+      sel.appendChild(opt);
+    }
+    sel.value = student;
+  }
+  $('#dmInput').value = '';
+  renderDmThread([]);
+  $('#dmDlg').showModal();
+  loadDmMessages();
+  if(dmPollTimer) clearInterval(dmPollTimer);
+  dmPollTimer = setInterval(loadDmMessages, 5000);
+}
+
+function renderDmThread(msgs){
+  const box = $('#dmThread');
+  if(!box) return;
+  box.innerHTML = '';
+  (msgs||[]).forEach(m=>{
+    const div = document.createElement('div');
+    const isTeacher = m.from === 'teacher';
+    div.className = 'dm-msg ' + (isTeacher ? 'me' : 'them');
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = m.text || '';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const tsMs = (m.ts||0)*1000;
+    meta.textContent = tsMs ? timeAgo(tsMs) : '';
+    div.appendChild(bubble);
+    div.appendChild(meta);
+    box.appendChild(div);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+async function loadDmMessages(){
+  if(!currentDmStudent) return;
+  try{
+    const res = await fetch('/api/dm/me?student='+encodeURIComponent(currentDmStudent));
+    if(!res.ok) return;
+    const msgs = await res.json();
+    renderDmThread(msgs);
+  }catch(e){
+    console.warn('failed to load dm messages', e);
+  }
+}
+
+$('#stuDM').onclick=()=>{
+  const student=currentStudent();
+  if(!student){ alert('Pick a student first'); return; }
+  openDmDialogFor(student);
+};
+$('#dmClose').onclick=()=>{
+  $('#dmDlg').close();
+  currentDmStudent = null;
+  if(dmPollTimer) { clearInterval(dmPollTimer); dmPollTimer = null; }
+};
+$('#dmSend').onclick=async()=>{
+  const text=$('#dmInput').value.trim();
+  if(!text){ alert('Type a message'); return; }
+  const student = currentDmStudent || currentStudent();
+  if(!student){ alert('Pick a student first'); return; }
+  try{
+    const r = await fetch('/api/dm/send',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({student, text, from:'teacher'})
+    });
+    if(!r.ok){
+      alert('Failed to send message');
+      return;
+    }
+    $('#dmInput').value = '';
+    loadDmMessages();
+  }catch(e){
+    console.error('dm send failed', e);
+    alert('Failed to send message');
+  }
+};
 /* -----------------------------------------------------------
    Raise-hand tray (unchanged)
 ----------------------------------------------------------- */
@@ -1089,11 +1177,40 @@ document.getElementById('applyChat').onclick = async ()=>{
 
 /* Scene actions */
 async function applyScene(id){
-  $('#sceneDropdown').classList.remove('open'); showOverlay();
+  $('#sceneDropdown').classList.remove('open');
+  showOverlay();
   try{
-    const r = await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scene_id:id})});
-    if(r.ok){ toast('Scene applied'); }
-  }finally{ hideOverlay(); loadScenes(); }
+    const payload = { scene_id: id };
+    const scopeStudent = document.getElementById('sceneScopeStudent');
+    if(scopeStudent && scopeStudent.checked){
+      const student = currentStudent();
+      if(!student){
+        hideOverlay();
+        alert('Pick a student first using Per-Student Controls, then apply the scene.');
+        return;
+      }
+      payload.students = [student];
+    }
+    const r = await fetch('/api/scenes/apply',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if(r.ok){
+      if(payload.students && payload.students.length){
+        toast('Scene applied to '+payload.students.join(', '));
+      }else{
+        toast('Scene applied to class');
+      }
+    }else{
+      console.warn('scene apply failed', r.status);
+    }
+  }catch(e){
+    console.error('scene apply error', e);
+  }finally{
+    hideOverlay();
+    loadScenes();
+  }
 }
 async function disableScene(){
   $('#sceneDropdown').classList.remove('open');
