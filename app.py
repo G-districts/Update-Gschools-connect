@@ -8,6 +8,7 @@ import json, os, time, sqlite3, traceback, uuid, re
 from urllib.parse import urlparse
 from datetime import datetime
 from collections import defaultdict
+from image_filter_ai import classify_image as _gschool_classify_image
 
 # ---------------------------
 # Flask App Initialization
@@ -2666,7 +2667,204 @@ def api_notify():
     save_data(d)
     log_action({"event": "notify", "title": title})
     return jsonify({"ok": True})
+# =========================
+# Image AI Filter (per-image, for extension)
+# =========================
 
+def _ensure_image_filter_config(d):
+    """
+    Ensure d["image_filter"] exists with safe defaults.
+
+    We intentionally do NOT change ensure_keys() so existing behavior
+    stays exactly the same unless this feature is used.
+    """
+    cfg = d.setdefault("image_filter", {})
+    cfg.setdefault("enabled", False)
+    cfg.setdefault("mode", "block")  # "block" or "monitor"
+    cfg.setdefault("block_threshold", 0.6)  # 0–1, higher = stricter
+    cfg.setdefault("alert_on_block", True)
+    cfg.setdefault("max_log_entries", 500)
+    d.setdefault("image_filter_events", [])
+    return cfg
+
+
+@app.route("/api/image_filter/config", methods=["GET", "POST"])
+def api_image_filter_config():
+    """
+    GET: anyone (including extension) can read generic config.
+    POST: only admin can update it.
+    """
+    d = ensure_keys(load_data())
+    cfg = _ensure_image_filter_config(d)
+
+    if request.method == "GET":
+        return jsonify({"ok": True, "config": cfg})
+
+    # POST = admin only
+    u = current_user()
+    if not u or u.get("role") != "admin":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.json or {}
+
+    if "enabled" in body:
+        cfg["enabled"] = bool(body["enabled"])
+
+    if body.get("mode") in ("block", "monitor"):
+        cfg["mode"] = body["mode"]
+
+    if "block_threshold" in body:
+        try:
+            th = float(body["block_threshold"])
+            th = max(0.1, min(0.99, th))
+            cfg["block_threshold"] = th
+        except Exception:
+            pass
+
+    if "alert_on_block" in body:
+        cfg["alert_on_block"] = bool(body["alert_on_block"])
+
+    if "max_log_entries" in body:
+        try:
+            m = int(body["max_log_entries"])
+            if m >= 50:
+                cfg["max_log_entries"] = m
+        except Exception:
+            pass
+
+    d["image_filter"] = cfg
+    save_data(d)
+    log_action({"event": "image_filter_config_update", "config": cfg})
+    return jsonify({"ok": True, "config": cfg})
+
+
+@app.route("/api/image_filter/evaluate", methods=["POST"])
+def api_image_filter_evaluate():
+    """
+    Called by the extension for EACH image.
+
+    Body:
+      {
+        "thumbnail": "data:image/jpeg;base64,...",  # optional small thumbnail
+        "src": "https://example.com/image.jpg",
+        "page_url": "https://example.com/page",
+        "student": "student@example.com"
+      }
+
+    Response:
+      {
+        "ok": true,
+        "action": "allow" | "block" | "monitor",
+        "reason": "explicit_nudity" | "other",
+        "scores": {label: score}
+      }
+    """
+    d = ensure_keys(load_data())
+    cfg = _ensure_image_filter_config(d)
+
+    body = request.json or {}
+    thumbnail = body.get("thumbnail") or body.get("image") or ""
+    src = (body.get("src") or "").strip()
+    page_url = (body.get("page_url") or "").strip()
+    student = (body.get("student") or "").strip()
+
+    # If disabled, always allow (but still respond).
+    if not cfg.get("enabled", False):
+        return jsonify({"ok": True, "action": "allow", "reason": "disabled", "scores": {}})
+
+    # Run lightweight classifier
+    try:
+        scores = _gschool_classify_image(thumbnail or None, src=src, page_url=page_url)
+    except Exception as e:
+        log_action({"event": "image_filter_error", "error": str(e)})
+        return jsonify({"ok": True, "action": "allow", "reason": "error", "scores": {}})
+
+    # Decide based on highest concerning label
+    block_threshold = float(cfg.get("block_threshold", 0.6))
+    primary_labels = [
+        "explicit_nudity",
+        "partial_nudity",
+        "suggestive",
+        "violence",
+        "weapon",
+        "self_harm",
+    ]
+
+    best_label = "other"
+    best_score = 0.0
+    for label in primary_labels:
+        val = float(scores.get(label, 0.0))
+        if val > best_score:
+            best_score = val
+            best_label = label
+
+    action = "allow"
+    if best_score >= block_threshold:
+        action = "block" if cfg.get("mode", "block") == "block" else "monitor"
+
+    # Append to dedicated log buffer
+    events = d.setdefault("image_filter_events", [])
+    events.append({
+        "ts": int(time.time()),
+        "student": student,
+        "page_url": page_url,
+        "src": src,
+        "action": action,
+        "label": best_label,
+        "score": best_score,
+    })
+    max_events = int(cfg.get("max_log_entries", 500) or 500)
+    d["image_filter_events"] = events[-max_events:]
+    save_data(d)
+
+    # When blocked, also create an alert for the teacher/admin
+    if action == "block" and cfg.get("alert_on_block", True):
+        try:
+            d2 = ensure_keys(load_data())
+            alerts = d2.setdefault("alerts", [])
+            alerts.append({
+                "ts": int(time.time()),
+                "student": student or "",
+                "kind": "image_inappropriate",
+                "score": float(best_score),
+                "title": best_label,
+                "url": page_url or src,
+                "note": src,
+            })
+            d2["alerts"] = alerts[-500:]
+            save_data(d2)
+            log_action({
+                "event": "image_filter_block",
+                "student": student,
+                "label": best_label,
+                "score": best_score,
+                "page_url": page_url,
+                "src": src,
+            })
+        except Exception:
+            pass
+
+    return jsonify({
+        "ok": True,
+        "action": action,
+        "reason": best_label,
+        "scores": scores,
+    })
+
+
+@app.route("/api/image_filter/logs", methods=["GET"])
+def api_image_filter_logs():
+    """
+    Admin-only endpoint to see recent image filter events.
+    Used by admin.html to show a live log of blocked/flagged images.
+    """
+    u = current_user()
+    if not u or u.get("role") != "admin":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    d = ensure_keys(load_data())
+    events = d.get("image_filter_events", [])[-500:]
+    return jsonify({"ok": True, "events": events})
 
 # =========================
 # Off-task alert (student)
