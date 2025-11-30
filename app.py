@@ -197,6 +197,7 @@ def ensure_keys(d):
     d.setdefault("categories", {})
     d.setdefault("pending_commands", {})
     d.setdefault("pending_per_student", {})
+    d.setdefault("student_scenes", {})
     d.setdefault("presence", {})
     d.setdefault("history", {})
     d.setdefault("screenshots", {})
@@ -1409,12 +1410,46 @@ def api_policy():
     # Scene merge logic
     store = _load_scenes()
     current_raw = store.get("current") or []
+
+    # Global scenes applied to the whole class
     if isinstance(current_raw, dict):
-        current_list = [current_raw]
+        base_current = [current_raw]
     elif isinstance(current_raw, list):
-        current_list = [c for c in current_raw if c]
+        base_current = [c for c in current_raw if c]
     else:
-        current_list = []
+        base_current = []
+
+    # Optional per‑student scenes stored in data.json
+    student_scenes_map = d.get("student_scenes") or {}
+    per_student_list = []
+    if student and student in student_scenes_map:
+        raw_list = student_scenes_map.get(student) or []
+        for c in raw_list:
+            if not c:
+                continue
+            per_student_list.append({
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "type": c.get("type"),
+            })
+
+    # Combine global + per‑student scenes, de‑duplicated by id
+    combined = []
+    seen_ids = set()
+    for src in (base_current, per_student_list):
+        for c in src:
+            if not c:
+                continue
+            sid = c.get("id")
+            if sid is None:
+                continue
+            key = str(sid)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            combined.append(c)
+
+    current_list = combined
 
     # Start with class-level lists
     allowlist = list(cls.get("allowlist", []))
@@ -1964,9 +1999,19 @@ def api_scenes_import():
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "invalid payload"}), 400
 
-@app.route("/api/scenes/apply", methods=["POST"])
+
 @app.route("/api/scenes/apply", methods=["POST"])
 def api_scenes_apply():
+    """
+    Apply a scene to the whole class or a subset of students.
+
+    JSON body:
+      - scene_id / id: ID of the scene to apply.
+      - disable: bool – if true, clears all scenes (class + per‑student).
+      - replace: bool – if true, replaces current scenes instead of appending.
+      - students: optional list of student emails – if present, the scene is applied
+                  only to those students; otherwise it's applied class‑wide.
+    """
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -1978,25 +2023,34 @@ def api_scenes_apply():
 
     store = _load_scenes()
 
+    # Disable all scenes – clear both global and per‑student assignment.
     if disable:
         store["current"] = []
         _save_scenes(store)
-        log_action({"event": "scene_disabled"})
 
         d = ensure_keys(load_data())
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
+        # Clear per‑student scene assignments as well
+        d["student_scenes"] = {}
+        d.setdefault("pending_commands", {}).setdefault("*", []).append(
+            {"type": "policy_refresh"}
+        )
         save_data(d)
-
+        log_action({"event": "scene_disabled"})
         return jsonify({"ok": True, "current": []})
 
     if not sid:
         return jsonify({"ok": False, "error": "scene_id required"}), 400
 
+    # Resolve the scene object.
     found = None
     for bucket in ("allowed", "blocked"):
-        for s in store.get(bucket, []):
+        for s in store.get(bucket, []) or []:
             if str(s.get("id")) == str(sid):
-                found = {"id": s["id"], "name": s.get("name"), "type": s.get("type")}
+                found = {
+                    "id": s.get("id"),
+                    "name": s.get("name"),
+                    "type": s.get("type") or bucket.rstrip("d"),  # "allowed"/"blocked"
+                }
                 break
         if found:
             break
@@ -2004,11 +2058,47 @@ def api_scenes_apply():
     if not found:
         return jsonify({"ok": False, "error": "scene not found"}), 404
 
-    cur = store.get("current") or []
-    if isinstance(cur, dict):
-        current_list = [cur]
-    elif isinstance(cur, list):
-        current_list = [c for c in cur if c]
+    # Optional per‑student targeting.
+    students = body.get("students") or []
+    if isinstance(students, str):
+        students = [students]
+    students = [s for s in students if s]
+
+    d = ensure_keys(load_data())
+
+    if students:
+        # Apply only to specific students – store in data.json so /api/policy can merge.
+        student_scenes = d.setdefault("student_scenes", {})
+
+        for stu in students:
+            cur_list = list(student_scenes.get(stu) or [])
+            if replace_mode:
+                cur_list = [found]
+            else:
+                # Append if not already present for that student
+                existing_ids = {str(c.get("id")) for c in cur_list}
+                if str(found.get("id")) not in existing_ids:
+                    cur_list.append(found)
+            student_scenes[stu] = cur_list
+
+            # Push a per‑student policy refresh so the extension re‑loads policy.
+            d.setdefault("pending_per_student", {}).setdefault(stu, []).append(
+                {"type": "policy_refresh"}
+            )
+
+        save_data(d)
+        log_action(
+            {"event": "scene_applied_students", "scene": found, "students": students}
+        )
+        # For teacher UI we still return the global "current" list.
+        return jsonify({"ok": True, "current": store.get("current") or []})
+
+    # No explicit students → class‑wide behaviour (existing behaviour).
+    current_raw = store.get("current") or []
+    if isinstance(current_raw, dict):
+        current_list = [current_raw]
+    elif isinstance(current_raw, list):
+        current_list = [c for c in current_raw if c]
     else:
         current_list = []
 
@@ -2021,13 +2111,15 @@ def api_scenes_apply():
 
     store["current"] = current_list
     _save_scenes(store)
-    log_action({"event": "scene_applied", "scene": found})
 
-    d = ensure_keys(load_data())
-    d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
+    # class‑wide policy refresh
+    d.setdefault("pending_commands", {}).setdefault("*", []).append(
+        {"type": "policy_refresh"}
+    )
     save_data(d)
-    return jsonify({"ok": True, "current": current_list})
 
+    log_action({"event": "scene_applied", "scene": found})
+    return jsonify({"ok": True, "current": current_list})
 
 @app.route("/api/scenes/clear", methods=["POST"])
 @app.route("/api/scenes/clear", methods=["POST"])
