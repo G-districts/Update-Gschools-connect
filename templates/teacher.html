@@ -925,6 +925,15 @@ function timeAgo(ts){
 refreshPresence();
 setInterval(refreshPresence, 8000);
 
+/* === YouTube Rules === */
+document.getElementById('saveYouTubeRules').onclick = async ()=>{
+  const blockKeywords = document.getElementById('ytBlockKeywords').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const blockChannels = document.getElementById('ytBlockChannels').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const allow = document.getElementById('ytAllowList').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const allowMode = document.getElementById('ytAllowMode').checked;
+  await fetch('/api/youtube_rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({block_keywords:blockKeywords,block_channels:blockChannels,allow:allow,allow_mode:allowMode})});
+  alert('YouTube rules updated');
+};
 async function loadYouTubeRules(){
   const res=await fetch('/api/youtube_rules');
   if(!res.ok) return;
