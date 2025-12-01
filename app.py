@@ -682,7 +682,7 @@ def api_data():
         # added for teacher.html compatibility
         "classes": {
             "period1": {
-                "name": cls.get("name", "Period 1"),
+                "name": cls.get("name", "Graden's Classroom"),
                 "active": bool(cls.get("active", True)),
                 "focus_mode": bool(cls.get("focus_mode", False)),
                 "paused": bool(cls.get("paused", False)),
